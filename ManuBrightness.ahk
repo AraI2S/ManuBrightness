@@ -4,13 +4,14 @@ Persistent
 
 ; ======================================================================================================================
 ; 脚本名称：
-;     ManuBrightness v6.2 —— 双模式软件亮度 + Gamma Ramp 严格一致性守护
+;     ManuBrightness v6.1.3 —— 双模式软件亮度 + Gamma Ramp 小容差守护（测试版）
 ;
 ; 项目版本沿革与当前定位：
 ;     过去的稳定工作版：ManuBrightness v5.1 = Gamma Ramp 第五版映射、50 步长。
 ;     v6.0 = 保留 v5.1 日常算法 + 新增独立影视映射。
 ;     v6.1 = 每秒状态读取、按需恢复与低频兜底写入。
-;     当前 v6.2 = 保留全部原有行为，将 Gamma Ramp 比较改为逐项严格一致。
+;     v6.2 = Gamma Ramp 逐项严格比较试验。
+;     当前 v6.1.3 = 基于 v6.2 的完整功能，仅将 Gamma Ramp 逐项比较容差改为 255（测试版）。
 ;     原来的 MapVersion=5 是“日常控制值 -> 有效视觉值”的映射版本，
 ;     不等于程序版本。本版日常映射没有变化，因此 MapVersion 仍为 5。
 ;
@@ -51,10 +52,11 @@ Persistent
 ;     Alt + 数字小键盘 / ：临时恢复“无本脚本介入”的标准显示映射
 ;     Alt + 主键盘 =     ：切换日常 / 影视模式
 ;
-; Gamma Ramp 自动维护（v6.2）：
+; Gamma Ramp 自动维护（v6.1.3 测试版）：
 ;     正常工作状态下每 1000 毫秒读取一次 GetDeviceGammaRamp，和当前模式的目标曲线比较。
-;     一旦有任意 16 位参数不一致，立即重新应用当前曲线；不改变亮度值，不显示提示，也不写入 ini。
-;     严格比较完整 3×256 项 Gamma Ramp：只要任意 ushort 不同，就认定参数不一致，不设置容差。
+;     比较完整 3×256 项 16 位 Gamma Ramp：任意一项与目标差值超过 255，就重新应用当前曲线。
+;     允许单项绝对误差 <= 255，主要用于容纳可能出现的 8 位硬件读回量化。
+;     不改变亮度值，不显示提示，也不写入 ini。
 ;     为防止驱动只返回缓存值、读数失败或报告过于粗略，每 30 次检查无条件重新写入一次。
 ;     用户手动按 Alt + 小键盘 / 暂停时：停止检查与所有自动写入；
 ;     下次 +/-、* 或切换模式后恢复检查。
@@ -182,7 +184,7 @@ Persistent
 ;     200 ~ 800 平滑稳定；800 以上快速冲向极限；960 ~ 1000 基本处于近最大提亮状态。
 ; ======================================================================================================================
 
-global appVersion := "6.2"
+global appVersion := "6.1.3"
 global levelFile := A_ScriptDir "\ManuBrightness.ini"
 global oldLevelFile := A_ScriptDir "\GpuBrightness.ini"
 
@@ -234,8 +236,11 @@ global filmToeStart := 0.003
 global filmToeEnd := 0.025
 
 ; Gamma Ramp 自动维护：工作时每秒读取检查一次。
-; 任意 16 位数值不一致时立即写回；保留每 30 秒兜底刷新。
+; 任一 16 位元素的绝对差值超过 255 时立即写回；保留每 30 秒兜底刷新。
 global gammaWatchIntervalMs := 1000
+; 8 位硬件可能只保留高 8 位，低 8 位差距最大为 255。
+; 这是测试阈值，不是已测定的当前显卡量化精度。
+global gammaWatchTolerance := 255
 ; 30 次 × 1000ms = 约 30 秒。
 global gammaWatchForceTicks := 30
 ; 当前是否由 Alt + 小键盘 / 临时暂停。
@@ -586,10 +591,10 @@ ApplyLevel(level){
     SetTimer(CheckGammaRamp, gammaWatchIntervalMs)
 }
 
-; 每秒严格比较实际 Gamma Ramp：任意一个 16 位值不一致即重新写入。
+; 每秒比较当前 Gamma Ramp：任意一个 16 位值与目标值偏差超过 255 时重新写入。
 CheckGammaRamp(){
     global gammaWatchPaused, gammaWatchTicks, gammaWatchForceTicks
-    global expectedGammaRamp, level
+    global expectedGammaRamp, level, gammaWatchTolerance
     if gammaWatchPaused
         return
 
@@ -613,12 +618,12 @@ CheckGammaRamp(){
     if !success
         return
 
-    ; 三个通道各 256 个 WORD，逐项严格比较；任意差异都触发修复。
+    ; 三个通道各 256 个 WORD：超出小容差（255）的差异才触发修复。
     Loop 768 {
         offset:=(A_Index-1)*2
         observed:=NumGet(currentRamp, offset, "ushort")
         desired:=NumGet(expectedGammaRamp, offset, "ushort")
-        if observed!=desired{
+        if Abs(observed-desired)>gammaWatchTolerance{
             ApplyLevel(level)
             return
         }
