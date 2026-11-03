@@ -4,11 +4,12 @@ Persistent
 
 ; ======================================================================================================================
 ; 脚本名称：
-;     ManuBrightness v6.0 —— 双模式软件亮度（原 V5 日常曲线 + 新影视曲线）
+;     ManuBrightness v6.1 —— 双模式软件亮度 + Gamma Ramp 自动维护
 ;
 ; 项目版本沿革与当前定位：
 ;     过去的稳定工作版：ManuBrightness v5.1 = Gamma Ramp 第五版映射、50 步长。
-;     当前版本：ManuBrightness v6.0 = 保留 v5.1 日常算法 + 新增独立影视映射。
+;     v6.0 = 保留 v5.1 日常算法 + 新增独立影视映射。
+;     当前 v6.1 = 完整继承 v6.0，加入每秒状态读取、按需恢复和低频兜底写入。
 ;     原来的 MapVersion=5 是“日常控制值 -> 有效视觉值”的映射版本，
 ;     不等于程序版本。本版日常映射没有变化，因此 MapVersion 仍为 5。
 ;
@@ -48,6 +49,16 @@ Persistent
 ;     Alt + 数字小键盘 * ：重新应用当前软件亮度，不改变数值
 ;     Alt + 数字小键盘 / ：临时恢复“无本脚本介入”的标准显示映射
 ;     Alt + 主键盘 =     ：切换日常 / 影视模式
+;
+; Gamma Ramp 自动维护（v6.1）：
+;     正常工作状态下每 1000 毫秒读取一次 GetDeviceGammaRamp，和当前模式的目标曲线比较。
+;     一旦发现明显偏离，自动重新应用当前曲线；不改变亮度值，不显示提示，也不写入 ini。
+;     读取值可能存在 8-bit 显示硬件量化，因此允许最多 512/65535 的单项差异。
+;     为防止驱动只返回缓存值、读数失败或报告过于粗略，每 30 次检查无条件重新写入一次。
+;     用户手动按 Alt + 小键盘 / 暂停时：停止检查与所有自动写入；
+;     下次 +/-、* 或切换模式后恢复检查。
+;     原本的 SetDeviceGammaRamp API 在 HDR/驱动/色彩配置上的局限仍然存在，
+;     因此这属于可靠性补强，不能保证屏幕每一种显示失常都能被探测到。
 ;
 ; 数值说明：
 ;     本脚本使用 0 ~ 1000 的控制标尺。
@@ -170,7 +181,7 @@ Persistent
 ;     200 ~ 800 平滑稳定；800 以上快速冲向极限；960 ~ 1000 基本处于近最大提亮状态。
 ; ======================================================================================================================
 
-global appVersion := "6.0"
+global appVersion := "6.1"
 global levelFile := A_ScriptDir "\ManuBrightness.ini"
 global oldLevelFile := A_ScriptDir "\GpuBrightness.ini"
 
@@ -220,6 +231,18 @@ global filmGammaMax := 4.0
 ; 黑位保护起点/终点（像素值已经归一化到 0..1）。
 global filmToeStart := 0.003
 global filmToeEnd := 0.025
+
+; Gamma Ramp 自动维护：工作时每秒读取检查一次。
+; 仅明显偏离时即时写回，另有 30 秒兜底刷新，避免读数缓存导致漏检。
+global gammaWatchIntervalMs := 1000
+global gammaWatchTolerance := 512
+; 30 次 × 1000ms = 约 30 秒。
+global gammaWatchForceTicks := 30
+; 当前是否由 Alt + 小键盘 / 临时暂停。
+global gammaWatchPaused := false
+; 记录目前应当生效的完整 3×256 项 Gamma Ramp。
+global expectedGammaRamp := Buffer(256*3*2, 0)
+global gammaWatchTicks := 0
 
 ; 默认进入日常，且两个模式分别记住自己的亮度。
 global activeMode := "Daily"
@@ -271,6 +294,11 @@ RefreshLevel(){
 }
 
 ResetGammaRamp(){
+    global gammaWatchPaused, gammaWatchTicks
+    ; 先禁止未来的自动补写，再执行一次标准 Gamma Ramp 写入。
+    gammaWatchPaused:=true
+    gammaWatchTicks:=0
+    SetTimer(CheckGammaRamp, 0)
     ApplyIdentityGammaRamp()
     ShowTip("软件亮度暂停")
 }
@@ -547,15 +575,59 @@ ClearTip(){
 }
 
 ApplyLevel(level){
-    global activeMode
+    global activeMode, gammaWatchPaused, gammaWatchTicks, gammaWatchIntervalMs
+    ; 四个能够恢复工作的操作，都通过这里重新启用自动维护。
+    gammaWatchPaused:=false
+    gammaWatchTicks:=0
     if activeMode="Film"
         ApplyFilmLevel(level)
     else
         ApplyDailyLevel(level)
+    SetTimer(CheckGammaRamp, gammaWatchIntervalMs)
+}
+
+; 每秒检测实际 Gamma Ramp。仅差异明显时立即重新写入，避免无谓的频繁 SetDeviceGammaRamp。
+CheckGammaRamp(){
+    global gammaWatchPaused, gammaWatchTicks, gammaWatchForceTicks
+    global gammaWatchTolerance, expectedGammaRamp, level
+    if gammaWatchPaused
+        return
+
+    gammaWatchTicks+=1
+
+    ; GetDeviceGammaRamp 有时只是驱动缓存的结果，因此定期强制补写一次。
+    if gammaWatchTicks>=gammaWatchForceTicks{
+        ApplyLevel(level)
+        return
+    }
+
+    hdc:=DllCall("GetDC", "ptr", 0, "ptr")
+    if !hdc
+        return
+
+    currentRamp:=Buffer(256*3*2, 0)
+    success:=DllCall("gdi32\GetDeviceGammaRamp", "ptr", hdc, "ptr", currentRamp, "int")
+    DllCall("ReleaseDC", "ptr", 0, "ptr", hdc)
+
+    ; 读取失败时不每秒盲写；30 秒兜底仍然有效。
+    if !success
+        return
+
+    ; 三个通道各 256 个 WORD，逐项对比。允许硬件读取时的微量舍入误差。
+    Loop 768 {
+        offset:=(A_Index-1)*2
+        observed:=NumGet(currentRamp, offset, "ushort")
+        desired:=NumGet(expectedGammaRamp, offset, "ushort")
+        if Abs(observed-desired)>gammaWatchTolerance{
+            ApplyLevel(level)
+            return
+        }
+    }
 }
 
 ; 日常版本沿用之前的完整 Gamma Ramp 公式和输入控制映射。
 ApplyDailyLevel(level){
+    global expectedGammaRamp
     hdc:=DllCall("GetDC", "ptr", 0, "ptr")
     ramp:=Buffer(256*3*2, 0)
 
@@ -586,6 +658,8 @@ ApplyDailyLevel(level){
         NumPut("ushort", v, ramp, (512+i)*2)
     }
 
+    ; 保存当前模式实际希望维持的曲线，供下一秒检测。
+    expectedGammaRamp:=ramp
     DllCall("gdi32\SetDeviceGammaRamp", "ptr", hdc, "ptr", ramp)
     DllCall("ReleaseDC", "ptr", 0, "ptr", hdc)
 }
@@ -596,6 +670,7 @@ ApplyDailyLevel(level){
 ;     对极深黑区域逐渐从恒等映射过渡到以上曲线，避免纯黑或近黑泛灰。
 ; ----------------------------------------------------------------------------------------------------------------------
 ApplyFilmLevel(level){
+    global expectedGammaRamp
     global filmReferenceLevel, filmGammaAt600, filmGammaSensitivity
     global filmGammaMin, filmGammaMax, filmToeStart, filmToeEnd
 
@@ -630,6 +705,8 @@ ApplyFilmLevel(level){
         NumPut("ushort", v, ramp, (512+i)*2)
     }
 
+    ; 保存当前模式实际希望维持的曲线，供下一秒检测。
+    expectedGammaRamp:=ramp
     DllCall("gdi32\SetDeviceGammaRamp", "ptr", hdc, "ptr", ramp)
     DllCall("ReleaseDC", "ptr", 0, "ptr", hdc)
 }
