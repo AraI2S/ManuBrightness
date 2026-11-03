@@ -4,7 +4,38 @@ Persistent
 
 ; ======================================================================================================================
 ; 脚本名称：
-;     ManuBrightness v5.1 —— 平滑常用区间 / 强高亮端（日常模式原版）
+;     ManuBrightness v6.0 —— 双模式软件亮度（原 V5 日常曲线 + 新影视曲线）
+;
+; 项目版本沿革与当前定位：
+;     过去的稳定工作版：ManuBrightness v5.1 = Gamma Ramp 第五版映射、50 步长。
+;     当前版本：ManuBrightness v6.0 = 保留 v5.1 日常算法 + 新增独立影视映射。
+;     原来的 MapVersion=5 是“日常控制值 -> 有效视觉值”的映射版本，
+;     不等于程序版本。本版日常映射没有变化，因此 MapVersion 仍为 5。
+;
+; 两种模式：
+;     日常：完全沿用上传的 v5.1 计算公式、控制值范围和每步 50 的行为。
+;     影视：一条新的、连续平滑的像素曲线，优先展开阴影、约束高光、保留纯黑。
+;     Alt + 主键盘 =：切换日常 / 影视。每个模式分别保存自己的控制数值。
+;     启动时默认进入日常模式；影视首次使用时默认亮度 600。
+;
+; 影视模式设计基准（便于以后修改）：
+;     在影视控制值 600 时，像素输入 5%、10%、20% 的输出约为
+;     22%、32%、45%，接近日常控制值 800 的暗部效果；
+;     而输入 80% 时输出约 89%，比日常控制值 600 更收敛。
+;     纯黑 (0) 始终映射到 0；极深黑先接近原值，随后平滑过渡到提亮曲线。
+;     影视曲线主要采用 y=x^filmGamma，无日常曲线的 gain 和 lift。
+;     影视控制值变化只改变 filmGamma，曲线不发生局部断裂。
+;
+; 黑位保护：
+;     对 0.3% 以下的输入基本保留原样，至 2.5% 平滑过渡完成。
+;     这是视觉尝试参数，不是 MiniLED 硬件问题的解决方案。
+;     如以后发现黑位被压得过狠，可适当降低 filmToeEnd；
+;     如果暗灰仍然泛白，可适当提高 filmToeEnd。
+;
+; 配置存储：
+;     新配置文件：ManuBrightness.ini（分别保存 DailyLevel / FilmLevel）。
+;     首次运行可自动读取同目录下旧 GpuBrightness.ini 的日常亮度，
+;     原文件保留不删除，以便随时回退老版本。
 ;
 ; 设备与任务背景：
 ;     用户使用 MSI Titan 18 Pro 2024 笔记本，搭载 RTX 4070 Laptop 显卡与 4K MiniLED 内屏。
@@ -16,6 +47,7 @@ Persistent
 ;     Alt + 数字小键盘 - ：降低软件亮度 stepSize
 ;     Alt + 数字小键盘 * ：重新应用当前软件亮度，不改变数值
 ;     Alt + 数字小键盘 / ：临时恢复“无本脚本介入”的标准显示映射
+;     Alt + 主键盘 =     ：切换日常 / 影视模式
 ;
 ; 数值说明：
 ;     本脚本使用 0 ~ 1000 的控制标尺。
@@ -138,7 +170,9 @@ Persistent
 ;     200 ~ 800 平滑稳定；800 以上快速冲向极限；960 ~ 1000 基本处于近最大提亮状态。
 ; ======================================================================================================================
 
-global levelFile := A_ScriptDir "\GpuBrightness.ini"
+global appVersion := "6.0"
+global levelFile := A_ScriptDir "\ManuBrightness.ini"
+global oldLevelFile := A_ScriptDir "\GpuBrightness.ini"
 
 ; 当前映射版本。
 global mapVersion := 5
@@ -174,7 +208,24 @@ global stepSize := 50
 ; 提示框持续时间，单位毫秒。
 global tipMs := 700
 
+; 影视模式曲线参数：在亮度 600 时 filmGamma=0.50。
+; 越小越抬亮阴影；越大则越压暗。只用于影视模式。
+global filmDefaultLevel := 600
+global filmReferenceLevel := 600
+global filmGammaAt600 := 0.50
+global filmGammaSensitivity := 0.0035
+global filmGammaMin := 0.12
+global filmGammaMax := 4.0
+
+; 黑位保护起点/终点（像素值已经归一化到 0..1）。
+global filmToeStart := 0.003
+global filmToeEnd := 0.025
+
+; 默认进入日常，且两个模式分别记住自己的亮度。
+global activeMode := "Daily"
 global level := LoadLevel()
+global dailyLevel := level
+global filmLevel := LoadFilmLevel()
 
 ApplyLevel(level)
 
@@ -187,6 +238,26 @@ ApplyLevel(level)
 
 ; Alt + 小键盘 /：临时恢复无脚本介入效果
 !NumpadDiv::ResetGammaRamp()
+
+; Alt + 主键盘 =：切换“日常 / 影视”模式（无需按 Shift）
+!=::SwitchMode()
+
+SwitchMode(){
+    global activeMode, level, dailyLevel, filmLevel
+    if activeMode="Daily"{
+        dailyLevel:=level
+        activeMode:="Film"
+        level:=filmLevel
+        modeLabel:="影视"
+    } else {
+        filmLevel:=level
+        activeMode:="Daily"
+        level:=dailyLevel
+        modeLabel:="日常"
+    }
+    ApplyLevel(level)
+    ShowTip("ManuBrightness " modeLabel ": " level)
+}
 
 Step(delta){
     global level
@@ -205,7 +276,7 @@ ResetGammaRamp(){
 }
 
 SetLevel(v){
-    global level, levelFile, mapVersion
+    global level, levelFile, mapVersion, activeMode, dailyLevel, filmLevel
 
     v:=RoundToStep(v)
     v:=ClampLevel(v)
@@ -213,16 +284,42 @@ SetLevel(v){
     level:=v
     ApplyLevel(level)
 
-    IniWrite(level, levelFile, "Main", "Level")
-    IniWrite(mapVersion, levelFile, "Main", "MapVersion")
+    if activeMode="Daily"{
+        dailyLevel:=level
+        IniWrite(level, levelFile, "Modes", "DailyLevel")
+        ; [Main] 保留旧脚本的数据结构，便于迁移与回溯。
+        IniWrite(level, levelFile, "Main", "Level")
+        IniWrite(mapVersion, levelFile, "Main", "MapVersion")
+        modeLabel:="日常"
+    } else {
+        filmLevel:=level
+        IniWrite(level, levelFile, "Modes", "FilmLevel")
+        modeLabel:="影视"
+    }
 
-    ShowTip("软件亮度: " level)
+    ShowTip(modeLabel "亮度: " level)
 }
 
 LoadLevel(){
-    global levelFile, mapVersion, defaultLevel
+    global levelFile, oldLevelFile, mapVersion, defaultLevel
 
-    raw:=IniRead(levelFile, "Main", "Level", "")
+    ; 已使用过 v6 的独立日常亮度，优先直接读取。
+    raw:=IniRead(levelFile, "Modes", "DailyLevel", "")
+    if raw!=""{
+        try {
+            return ClampLevel(Float(raw))
+        } catch {
+            ; 无效数值则继续尝试原版数据。
+        }
+    }
+
+    ; 兼容新文件的 [Main]，然后尝试同目录的旧 GpuBrightness.ini。
+    sourceFile:=levelFile
+    raw:=IniRead(sourceFile, "Main", "Level", "")
+    if raw=""{
+        sourceFile:=oldLevelFile
+        raw:=IniRead(sourceFile, "Main", "Level", "")
+    }
 
     if raw=""{
         return ClampLevel(defaultLevel)
@@ -232,12 +329,9 @@ LoadLevel(){
     catch
         v:=defaultLevel
 
-    storedVersion:=IniRead(levelFile, "Main", "MapVersion", "1")
+    storedVersion:=IniRead(sourceFile, "Main", "MapVersion", "1")
 
-    if storedVersion=String(mapVersion){
-        return ClampLevel(v)
-    }
-
+    ; 按旧脚本的既有公式迁移（包括旧版 V1..V4）。
     if storedVersion="4"{
         effectiveLevel:=MapV4ControlToEffective(v)
         v:=MapEffectiveToControl(effectiveLevel)
@@ -250,17 +344,34 @@ LoadLevel(){
         v:=MapEffectiveToControl(effectiveLevel)
     } else if storedVersion="1"{
         v:=MapEffectiveToControl(v)
-    } else {
+    } else if storedVersion!=String(mapVersion){
         v:=defaultLevel
     }
 
-    v:=RoundToStep(v)
+    ; 已是 V5 时保持原始数值；需要迁移时才按原工作版的规则对齐步长。
+    if storedVersion!=String(mapVersion){
+        v:=RoundToStep(v)
+    }
     v:=ClampLevel(v)
 
+    ; 新文件独立保存；不会修改旧 GpuBrightness.ini。
+    IniWrite(v, levelFile, "Modes", "DailyLevel")
     IniWrite(v, levelFile, "Main", "Level")
     IniWrite(mapVersion, levelFile, "Main", "MapVersion")
 
     return v
+}
+
+LoadFilmLevel(){
+    global levelFile, filmDefaultLevel
+    raw:=IniRead(levelFile, "Modes", "FilmLevel", "")
+    if raw=""
+        return filmDefaultLevel
+    try {
+        return ClampLevel(Float(raw))
+    } catch {
+        return filmDefaultLevel
+    }
 }
 
 RoundToStep(v){
@@ -436,6 +547,15 @@ ClearTip(){
 }
 
 ApplyLevel(level){
+    global activeMode
+    if activeMode="Film"
+        ApplyFilmLevel(level)
+    else
+        ApplyDailyLevel(level)
+}
+
+; 日常版本沿用之前的完整 Gamma Ramp 公式和输入控制映射。
+ApplyDailyLevel(level){
     hdc:=DllCall("GetDC", "ptr", 0, "ptr")
     ramp:=Buffer(256*3*2, 0)
 
@@ -459,6 +579,50 @@ ApplyLevel(level){
         else if y>1
             y:=1
 
+        v:=Round(y*65535)
+
+        NumPut("ushort", v, ramp, i*2)
+        NumPut("ushort", v, ramp, (256+i)*2)
+        NumPut("ushort", v, ramp, (512+i)*2)
+    }
+
+    DllCall("gdi32\SetDeviceGammaRamp", "ptr", hdc, "ptr", ramp)
+    DllCall("ReleaseDC", "ptr", 0, "ptr", hdc)
+}
+
+; ----------------------------------------------------------------------------------------------------------------------
+; 影视模式：保黑位、展暗部、收高光。
+;     y = x^filmGamma（无 gain / lift）
+;     对极深黑区域逐渐从恒等映射过渡到以上曲线，避免纯黑或近黑泛灰。
+; ----------------------------------------------------------------------------------------------------------------------
+ApplyFilmLevel(level){
+    global filmReferenceLevel, filmGammaAt600, filmGammaSensitivity
+    global filmGammaMin, filmGammaMax, filmToeStart, filmToeEnd
+
+    gamma:=filmGammaAt600 * Exp((filmReferenceLevel-level)*filmGammaSensitivity)
+    gamma:=Max(filmGammaMin, Min(filmGammaMax, gamma))
+
+    hdc:=DllCall("GetDC", "ptr", 0, "ptr")
+    ramp:=Buffer(256*3*2, 0)
+
+    Loop 256{
+        i:=A_Index-1
+        x:=i/255.0
+
+        boosted:=x**gamma
+
+        if gamma<1{
+            ; 平滑保护最深黑。0..0.3% 基本不动，2.5% 起完整应用提亮曲线。
+            t:=(x-filmToeStart)/(filmToeEnd-filmToeStart)
+            t:=Max(0,Min(1,t))
+            weight:=t*t*(3-2*t)
+            y:=x+(boosted-x)*weight
+        } else {
+            ; 暗化时直接使用幂次曲线，黑位天然为 0。
+            y:=boosted
+        }
+
+        y:=Max(0,Min(1,y))
         v:=Round(y*65535)
 
         NumPut("ushort", v, ramp, i*2)
