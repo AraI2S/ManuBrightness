@@ -1,8 +1,12 @@
-﻿# ManuBrightness v7.0.0 - Windows-native source edition (first migration trial)
+﻿# ManuBrightness v7.0.2 - Windows-native source edition (High-DPI UI)
 # Windows 10/11 + built-in Windows PowerShell 5.1 / .NET Framework.
 # No AutoHotkey, Python, third-party DLL, or precompiled binary is required.
 # All code is plain text. C# below is compiled in memory at startup by Add-Type.
 # Double-click Main.cmd from the same folder to start.
+# The short-lived launcher spawns a console-free process; the application
+# stays alive in the system tray after the launcher exits.
+# DPI awareness is initialized before WinForms creates any UI windows,
+# preventing Windows bitmap-upscaling the tooltip and tray context menu.
 #
 # The Daily and Film math, config migration, hotkeys, and Gamma Ramp guard are
 # ported from the tested ManuBrightness v6.1.3 AutoHotkey script.
@@ -13,7 +17,44 @@
 # the physical backlight. The Windows API has limitations with HDR, ICC and
 # some display drivers. Keep the original AHK version available for rollback.
 
+# -LaunchBackground is an internal entry point used only by Main.cmd.
+# Windows Terminal can ignore powershell.exe -WindowStyle Hidden when launched
+# directly. CreateNoWindow (with UseShellExecute=false) creates a genuinely
+# console-free process that can outlive the temporary CMD/PowerShell launcher.
+param([switch]$LaunchBackground)
+
 $ErrorActionPreference = 'Stop'
+
+if ($LaunchBackground) {
+    try {
+        $background = New-Object System.Diagnostics.ProcessStartInfo
+        $background.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $background.Arguments = '-NoLogo -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
+        $background.WorkingDirectory = $PSScriptRoot
+        $background.UseShellExecute = $false
+        $background.CreateNoWindow = $true
+        $child = [System.Diagnostics.Process]::Start($background)
+        if ($null -eq $child) { throw 'Could not create the background PowerShell process.' }
+        $child.Dispose()
+        exit 0
+    }
+    catch {
+        $errorText = $_.Exception.ToString()
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            [System.Windows.Forms.MessageBox]::Show(
+                "Unable to launch ManuBrightness in the background.`r`n`r`n" + $errorText,
+                'ManuBrightness - launch error',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+        catch {
+            Write-Host $errorText
+        }
+        exit 1
+    }
+}
 
 $source = @'
 using System;
@@ -44,6 +85,19 @@ namespace ManuBrightness.Native
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern int ReleaseDC(IntPtr window, IntPtr dc);
 
+        // DPI mode must be set before WinForms creates any HWND; this process
+        // is the headless PowerShell child, not the short-lived CMD launcher.
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetProcessDPIAware();
+
         [DllImport("gdi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool SetDeviceGammaRamp(IntPtr dc, [In] ushort[] ramp);
@@ -61,6 +115,41 @@ namespace ManuBrightness.Native
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool WritePrivateProfileString(
             string section, string key, string value, string fileName);
+    }
+
+    // On a high-DPI display, a DPI-unaware PowerShell process causes Windows
+    // to enlarge the entire WinForms window as a bitmap (blurry text).
+    // Prefer Per-Monitor V2 so text is drawn at the monitor's actual DPI.
+    // A preconfigured PowerShell host may reject changing its process-wide
+    // mode; in that case, set the UI thread's awareness before any HWND exists.
+    internal static class HighDpi
+    {
+        private static readonly IntPtr PerMonitorV2 = new IntPtr(-4);
+        private static readonly IntPtr PerMonitorV1 = new IntPtr(-3);
+
+        private static bool TryProcess(IntPtr context)
+        {
+            try { return Win32.SetProcessDpiAwarenessContext(context); }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        private static bool TryThread(IntPtr context)
+        {
+            try { return Win32.SetThreadDpiAwarenessContext(context) != IntPtr.Zero; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        internal static void Initialize()
+        {
+            if (TryProcess(PerMonitorV2)) return;
+            if (TryThread(PerMonitorV2)) return;
+            if (TryProcess(PerMonitorV1)) return;
+            if (TryThread(PerMonitorV1)) return;
+
+            // Legacy Windows fallback: crisp at startup monitor DPI.
+            try { Win32.SetProcessDPIAware(); }
+            catch (EntryPointNotFoundException) { }
+        }
     }
 
     internal static class Ini
@@ -169,6 +258,8 @@ namespace ManuBrightness.Native
 
         internal TipWindow()
         {
+            // Enable DPI-based WinForms layout on the current monitor.
+            AutoScaleMode = AutoScaleMode.Dpi;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -201,13 +292,17 @@ namespace ManuBrightness.Native
         internal void Display(string text)
         {
             message.Text = text;
+            // TextRenderer measures real pixel glyphs once DPI awareness is on.
+            // Scale the surrounding padding and mouse offset as well.
+            float scale = Math.Max(1f, DeviceDpi / 96f);
             Size measured = TextRenderer.MeasureText(text, message.Font);
-            Size = new Size(measured.Width + 24, measured.Height + 14);
+            Size = new Size(measured.Width + (int)Math.Ceiling(24 * scale),
+                            measured.Height + (int)Math.Ceiling(14 * scale));
 
             Point cursor = Cursor.Position;
             Rectangle available = Screen.FromPoint(cursor).WorkingArea;
-            int x = Math.Min(cursor.X + 14, available.Right - Width);
-            int y = Math.Min(cursor.Y + 21, available.Bottom - Height);
+            int x = Math.Min(cursor.X + (int)Math.Ceiling(14 * scale), available.Right - Width);
+            int y = Math.Min(cursor.Y + (int)Math.Ceiling(21 * scale), available.Bottom - Height);
             Location = new Point(Math.Max(available.Left, x), Math.Max(available.Top, y));
 
             if (!Visible) Show();
@@ -412,7 +507,7 @@ namespace ManuBrightness.Native
             };
 
             menu = new ContextMenuStrip();
-            ToolStripMenuItem status = new ToolStripMenuItem("ManuBrightness v7.0.0");
+            ToolStripMenuItem status = new ToolStripMenuItem("ManuBrightness v7.0.2");
             status.Enabled = false;
             menu.Items.Add(status);
             menu.Items.Add(new ToolStripSeparator());
@@ -432,7 +527,7 @@ namespace ManuBrightness.Native
 
             tray = new NotifyIcon();
             tray.Icon = SystemIcons.Application;
-            tray.Text = "ManuBrightness v7.0.0";
+            tray.Text = "ManuBrightness v7.0.2";
             tray.ContextMenuStrip = menu;
             tray.Visible = true;
             tray.DoubleClick += delegate(object sender, EventArgs e)
@@ -640,6 +735,8 @@ namespace ManuBrightness.Native
                 if (!firstInstance) return;
                 try
                 {
+                    // Must be the first UI-related operation on this STA thread.
+                    HighDpi.Initialize();
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     Application.Run(new BrightnessApp(directory));
@@ -666,7 +763,7 @@ catch {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
         $details = $_.Exception.ToString()
         [System.Windows.Forms.MessageBox]::Show(
-            "ManuBrightness v7.0.0 could not start.`r`n`r`n" + $details,
+            "ManuBrightness v7.0.2 could not start.`r`n`r`n" + $details,
             'ManuBrightness - startup error',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error
